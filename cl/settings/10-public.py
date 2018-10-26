@@ -1,8 +1,8 @@
 import datetime
+import os
 import re
 import sys
 
-import os
 from django.contrib.messages import constants as message_constants
 from judge_pics import judge_root
 
@@ -99,6 +99,7 @@ INSTALLED_APPS = [
     'cl.lib',
     'cl.opinion_page',
     'cl.recap',
+    'cl.recap_rss',
     'cl.scrapers',
     'cl.search',
     'cl.simple_pages',
@@ -129,10 +130,10 @@ MESSAGE_TAGS = {
 ########
 # Solr #
 ########
-SOLR_OPINION_URL = 'http://127.0.0.1:8983/solr/collection1'
-SOLR_AUDIO_URL = 'http://127.0.0.1:8983/solr/audio'
-SOLR_PEOPLE_URL = 'http://127.0.0.1:8983/solr/person'
-SOLR_RECAP_URL = 'http://127.0.0.1:8983/solr/recap'
+SOLR_OPINION_URL = '%s/solr/collection1' % SOLR_HOST
+SOLR_AUDIO_URL = '%s/solr/audio' % SOLR_HOST
+SOLR_PEOPLE_URL = '%s/solr/person' % SOLR_HOST
+SOLR_RECAP_URL = '%s/solr/recap' % SOLR_RECAP_HOST
 SOLR_URLS = {
     'opinions': SOLR_OPINION_URL,
     'audio': SOLR_AUDIO_URL,
@@ -145,12 +146,12 @@ SOLR_AUDIO_TEST_CORE_NAME = 'audio_test'
 SOLR_PEOPLE_TEST_CORE_NAME = 'person_test'
 SOLR_RECAP_TEST_CORE_NAME = 'recap_test'
 
-SOLR_OPINION_TEST_URL = 'http://127.0.0.1:8983/solr/opinion_test'
-SOLR_AUDIO_TEST_URL = 'http://127.0.0.1:8983/solr/audio_test'
-SOLR_PEOPLE_TEST_URL = 'http://127.0.0.1:8983/solr/person_test'
-SOLR_RECAP_TEST_URL = 'http://127.0.0.1:8983/solr/recap_test'
+SOLR_OPINION_TEST_URL = '%s/solr/opinion_test' % SOLR_HOST
+SOLR_AUDIO_TEST_URL = '%s/solr/audio_test' % SOLR_HOST
+SOLR_PEOPLE_TEST_URL = '%s/solr/person_test' % SOLR_HOST
+SOLR_RECAP_TEST_URL = '%s/solr/recap_test' % SOLR_RECAP_HOST
 SOLR_TEST_URLS = {
-    'opinion': SOLR_OPINION_TEST_URL,
+    'opinions': SOLR_OPINION_TEST_URL,
     'audio': SOLR_AUDIO_TEST_URL,
     'person': SOLR_PEOPLE_TEST_URL,
     'recap': SOLR_RECAP_TEST_URL,
@@ -165,10 +166,8 @@ REDIS_DATABASES = {
     'CELERY': 0,
     'CACHE': 1,
     'STATS': 2,
+    'ALERTS': 3,
 }
-REDIS_HOST = 'localhost'
-REDIS_PORT = 6379
-
 
 ##########
 # CELERY #
@@ -186,7 +185,7 @@ else:
                                                   REDIS_DATABASES['CELERY'])
     CELERYD_CONCURRENCY = 20
     BROKER_POOL_LIMIT = 30
-    CELERY_TASK_RESULT_EXPIRES = 3600
+    CELERY_TASK_RESULT_EXPIRES = 60 * 60
     BROKER_TRANSPORT_OPTIONS = {
         # This is the length of time a task will wait to be acknowledged by a
         # worker. This value *must* be greater than the largest ETA/countdown
@@ -207,11 +206,15 @@ CELERY_SEND_TASK_ERROR_EMAILS = True
 CACHES = {
     'default': {
         'BACKEND': 'redis_cache.RedisCache',
-        'LOCATION': 'localhost:6379',
+        'LOCATION': '%s:%s' % (REDIS_HOST, REDIS_PORT),
         'OPTIONS': {
             'DB': REDIS_DATABASES['CACHE'],
         },
     },
+    'db_cache': {
+        'BACKEND': 'django.core.cache.backends.db.DatabaseCache',
+        'LOCATION': 'django_cache',
+    }
 }
 # This sets Redis as the session backend. This is often advised against, but we
 # have pretty good persistency in Redis, so it's fairly well backed up.
@@ -225,6 +228,7 @@ if DEVELOPMENT:
 
 SERVER_EMAIL = 'CourtListener <noreply@courtlistener.com>'
 DEFAULT_FROM_EMAIL = 'CourtListener <noreply@courtlistener.com>'
+DEFAULT_ALERTS_EMAIL = 'CourtListener Alerts <alerts@courtlistener.com>'
 SCRAPER_ADMINS = (
     ('Slack Juriscraper Channel', 'j9f4b5n5x7k8x2r1@flp-talk.slack.com'),
     ('PA', 'arderyp@protonmail.com'),
@@ -256,8 +260,11 @@ STRIPE_REDIRECT = 'https://www.courtlistener.com/donate/stripe/complete/'
 
 MIN_DONATION = {
     'rt_alerts': 10,
+    'docket_alerts': 5,
 }
 FUNDRAISING_MODE = False
+MAX_FREE_DOCKET_ALERTS = 5
+DOCKET_ALERT_RECAP_BONUS = 10
 
 
 #######
@@ -301,8 +308,8 @@ REST_FRAMEWORK = {
     # Auth
     'DEFAULT_AUTHENTICATION_CLASSES': (
         'rest_framework.authentication.BasicAuthentication',
-        'rest_framework.authentication.SessionAuthentication',
         'rest_framework.authentication.TokenAuthentication',
+        'rest_framework.authentication.SessionAuthentication',
     ),
 
     # Rendering and Parsing
@@ -366,6 +373,13 @@ MARKDOWN_DEUX_STYLES = {
         ],
     },
 }
+
+
+#########
+# PIWIK #
+#########
+PIWIK_URL = 'https://piwik.courtlistener.com/piwik.php'
+PIWIK_SITE_ID = '1'
 
 
 ########

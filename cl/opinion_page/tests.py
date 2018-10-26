@@ -4,9 +4,9 @@ from django.test import TestCase, override_settings
 from rest_framework.status import HTTP_200_OK, HTTP_404_NOT_FOUND, \
     HTTP_302_FOUND
 
-from cl.lib import sunburnt
+from cl.lib.scorched_utils import ExtraSolrInterface
 from cl.lib.test_helpers import SitemapTest
-from cl.sitemap import make_sitemap_solr_params
+from cl.sitemap import make_sitemap_solr_params, items_per_sitemap
 
 
 class ViewDocumentTest(TestCase):
@@ -74,6 +74,23 @@ class CitationRedirectorTest(TestCase):
         )
         self.assertStatus(r, HTTP_404_NOT_FOUND)
 
+    def test_volume_page(self):
+        r = self.client.get(
+            reverse('citation_redirector', kwargs={
+                'reporter': 'F.2d',
+            })
+        )
+        self.assertStatus(r, HTTP_200_OK)
+
+    def test_case_page(self):
+        r = self.client.get(
+            reverse('citation_redirector', kwargs={
+                'reporter': 'F.2d',
+                'volume': '56',
+            })
+        )
+        self.assertStatus(r, HTTP_200_OK)
+
 
 class ViewRecapDocketTest(TestCase):
     fixtures = ['test_objects_search.json', 'judge_judy.json']
@@ -101,17 +118,20 @@ class ViewRecapDocketTest(TestCase):
 class OpinionSitemapTest(SitemapTest):
     def __init__(self, *args, **kwargs):
         super(OpinionSitemapTest, self).__init__(*args, ** kwargs)
-        self.sitemap_url = reverse('opinion_sitemap')
+        self.court_id = 'test'
+        self.sitemap_url = '%s?court=%s' % (reverse('opinion_sitemap'),
+                                            self.court_id)
 
     def get_expected_item_count(self):
         # OpinionsSitemap uses the solr index to generate the page, so the only
-        # accurate count comes from the index itself which will also be based on
-        # the fixtures.
-        conn = sunburnt.SolrInterface(settings.SOLR_OPINION_URL, mode='r')
+        # accurate count comes from the index itself which will also be based
+        # on the fixtures.
+        conn = ExtraSolrInterface(settings.SOLR_OPINION_URL)
         params = make_sitemap_solr_params('dateFiled asc', 'o_sitemap')
-        params['rows'] = 1000
+        params['rows'] = items_per_sitemap
+        params['fq'] = ['court_exact:%s' % self.court_id]
 
-        r = conn.raw_query(**params).execute()
+        r = conn.query().add_extra(**params).execute()
 
         # the underlying SitemapTest relies on counting url elements in the xml
         # response...this logic mimics the creation of the xml, so we at least

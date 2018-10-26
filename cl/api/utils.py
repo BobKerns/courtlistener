@@ -1,8 +1,8 @@
 import json
+import os
 from collections import OrderedDict, defaultdict
 from datetime import date
 
-import os
 import redis
 from dateutil import parser
 from dateutil.rrule import DAILY, rrule
@@ -10,8 +10,11 @@ from django.conf import settings
 from django.contrib.auth.models import User
 from django.contrib.humanize.templatetags.humanize import intcomma, ordinal
 from django.core.mail import send_mail
+from django.utils.decorators import method_decorator
 from django.utils.encoding import force_text
 from django.utils.timezone import now
+from django.views.decorators.cache import cache_page
+from django.views.decorators.vary import vary_on_headers
 from rest_framework import serializers
 from rest_framework.metadata import SimpleMetadata
 from rest_framework.pagination import PageNumberPagination
@@ -131,7 +134,8 @@ class SimpleMetadataWithFilters(SimpleMetadata):
 class LoggingMixin(object):
     """Log requests to Redis
 
-    This draws inspiration from the code that can be found at: https://github.com/aschn/drf-tracking/blob/master/rest_framework_tracking/mixins.py
+    This draws inspiration from the code that can be found at:
+      https://github.com/aschn/drf-tracking/blob/master/rest_framework_tracking/mixins.py
 
     The big distinctions, however, are that this code uses Redis for greater
     speed, and that it logs significantly less information.
@@ -194,6 +198,16 @@ class LoggingMixin(object):
                     email['from'],
                     [user.email],
                 )
+
+
+class CacheListMixin(object):
+    """Cache listed results"""
+
+    @method_decorator(cache_page(60))
+    # Ensure that permissions are maintained and not cached!
+    @method_decorator(vary_on_headers('Cookie', 'Authorization'))
+    def list(self, *args, **kwargs):
+        return super(CacheListMixin, self).list(*args, **kwargs)
 
 
 class ExceptionalUserRateThrottle(UserRateThrottle):

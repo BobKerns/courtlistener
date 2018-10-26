@@ -4,19 +4,23 @@ from django.conf import settings
 from django.contrib.admin.views.decorators import staff_member_required
 from django.contrib.auth.models import User
 from django.core.urlresolvers import reverse
-from django.http import HttpResponseRedirect
+from django.http import HttpResponseRedirect, HttpResponseNotAllowed, \
+    HttpResponse
 from django.shortcuts import render
+from django.utils.timezone import now
 
 from cl.donate.forms import DonationForm, UserForm, ProfileForm
-from cl.donate.models import Donation
+from cl.donate.models import Donation, MonthlyDonation, PROVIDERS
 from cl.donate.paypal import process_paypal_payment
-from cl.donate.stripe_helpers import process_stripe_payment
+from cl.donate.stripe_helpers import process_stripe_payment, \
+    create_stripe_customer
+from cl.donate.utils import PaymentFailureException, send_thank_you_email
 from cl.users.utils import create_stub_account
 
 logger = logging.getLogger(__name__)
 
 
-def route_and_process_donation(cd_donation_form, cd_user_form, stripe_token):
+def route_and_process_donation(cd_donation_form, cd_user_form, kwargs):
     """Routes the donation to the correct payment provider, then normalizes
     its response.
 
@@ -25,33 +29,29 @@ def route_and_process_donation(cd_donation_form, cd_user_form, stripe_token):
      - status: The status of the payment for the database
      - payment_id: The ID of the payment
     """
-    if cd_donation_form['payment_provider'] == 'paypal':
+    if cd_donation_form['payment_provider'] == PROVIDERS.PAYPAL:
         response = process_paypal_payment(cd_donation_form)
-        if response['result'] == 'created':
-            response = {
-                'message': None,
-                'status': Donation.AWAITING_PAYMENT,
-                'payment_id': response['payment_id'],
-                'transaction_id': response['transaction_id'],
-                'redirect': response['redirect'],
-            }
-        else:
-            response = {
-                'message': 'We had an error working with PayPal. Please try '
-                           'another payment method.',
-                'status': Donation.UNKNOWN_ERROR,
-                'payment_id': None,
-                'redirect': None,
-            }
-    elif cd_donation_form['payment_provider'] == 'cc':
-        response = process_stripe_payment(
-            cd_donation_form,
-            cd_user_form,
-            stripe_token
-        )
+    elif cd_donation_form['payment_provider'] == PROVIDERS.CREDIT_CARD:
+        # Calculate the amount in cents
+        amount = int(float(cd_donation_form['amount']) * 100)
+        response = process_stripe_payment(amount, cd_user_form['email'],
+                                          kwargs)
     else:
         response = None
     return response
+
+
+def add_monthly_donations(cd_donation_form, user, customer):
+    """Sets things up for monthly donations to run properly."""
+    monthly_donation = MonthlyDonation(
+        donor=user,
+        enabled=True,
+        monthly_donation_amount=cd_donation_form['amount'],
+        monthly_donation_day=min(now().date().day, 28),
+    )
+    monthly_donation.payment_provider = PROVIDERS.CREDIT_CARD
+    monthly_donation.stripe_customer_id = customer.id
+    monthly_donation.save()
 
 
 def donate(request):
@@ -116,14 +116,27 @@ def donate(request):
             cd_user_form = user_form.cleaned_data
             cd_profile_form = profile_form.cleaned_data
             stripe_token = request.POST.get('stripeToken')
+            frequency = request.POST.get('frequency')
 
             # Route the payment to a payment provider
-            response = route_and_process_donation(
-                cd_donation_form,
-                cd_user_form,
-                stripe_token
-            )
-            logger.info("Payment routed with response: %s" % response)
+            try:
+                if frequency == 'once':
+                    response = route_and_process_donation(
+                        cd_donation_form, cd_user_form, {'card': stripe_token})
+                elif frequency == 'monthly':
+                    customer = create_stripe_customer(stripe_token,
+                                                      cd_user_form['email'])
+                    response = route_and_process_donation(
+                        cd_donation_form, cd_user_form,
+                        {'customer': customer.id,
+                         'metadata': {'recurring': True}},
+                    )
+            except PaymentFailureException as e:
+                logger.critical("Payment failed. Message was: %s", e.message)
+                message = e.message
+                response = {'status': 'Failed'}
+            else:
+                logger.info("Payment routed with response: %s", response)
 
             if response['status'] == Donation.AWAITING_PAYMENT:
                 if request.user.is_anonymous() and not stub_account:
@@ -145,13 +158,10 @@ def donate(request):
                 donation.donor = user
                 donation.save()
 
-                return HttpResponseRedirect(response['redirect'])
+                if frequency == 'monthly':
+                    add_monthly_donations(cd_donation_form, user, customer)
 
-            else:
-                logger.critical("Got back status of %s when making initial "
-                                "request of API. Message was:\n%s" %
-                                (response['status'], response['message']))
-                message = response['message']
+                return HttpResponseRedirect(response['redirect'])
     else:
         # Loading the page...
         try:
@@ -207,13 +217,32 @@ def donate_complete(request):
     })
 
 
+def toggle_monthly_donation(request):
+    """Use Ajax to enable/disable monthly contributions"""
+    if request.is_ajax() and request.method == 'POST':
+        monthly_pk = request.POST.get('id')
+        m_donation = MonthlyDonation.objects.get(pk=monthly_pk)
+        state = m_donation.enabled
+        if state:
+            m_donation.enabled = False
+            msg = "Monthly contribution disabled successfully"
+        else:
+            m_donation.enabled = True
+            msg = "Monthly contribution enabled successfully"
+        m_donation.save()
+        return HttpResponse(msg)
+    else:
+        return HttpResponseNotAllowed(permitted_methods={'POST'},
+                                      content="Not an Ajax POST request.")
+
+
 @staff_member_required
 def make_check_donation(request):
     """A page for admins to use to input check donations manually."""
     if request.method == 'POST':
         data = request.POST.copy()
         data.update({
-            'payment_provider': Donation.CHECK,
+            'payment_provider': PROVIDERS.CHECK,
             'amount': 'other',
         })
         donation_form = DonationForm(data)
@@ -246,6 +275,8 @@ def make_check_donation(request):
             d.status = Donation.PROCESSED
             d.donor = user
             d.save()
+            if user.email:
+                send_thank_you_email(d)
 
             return HttpResponseRedirect(reverse('check_complete'))
     else:

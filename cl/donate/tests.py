@@ -1,9 +1,9 @@
 # coding=utf-8
 import json
-import stripe
-
 from datetime import datetime, timedelta
 from unittest import skipIf
+
+import stripe
 from django.conf import settings
 from django.core import mail
 from django.core.urlresolvers import reverse
@@ -62,13 +62,14 @@ class DonationFormSubmissionTest(TestCase):
             'email': 'pandora@courtlistener.com',
             'send_annual_reminder': True,
             'payment_provider': 'paypal',
+            'frequency': 'once',
         }
 
     def test_paypal_with_other_value_as_anonymous(self):
         """Can a paypal donation go through using the "Other" field?"""
         self.params.update({
             'amount': 'other',
-            'amount_other': '1',
+            'amount_other': '5',
         })
         r = self.client.post(
             reverse('donate'),
@@ -96,7 +97,11 @@ class StripeTest(TestCase):
     def setUp(self):
         self.client = Client()
 
-    def make_a_donation(self, cc_number, amount, amount_other=''):
+    def make_a_donation(self, cc_number, amount, amount_other='',
+                        param_overrides=None):
+        if param_overrides is None:
+            param_overrides = {}
+
         stripe.api_key = settings.STRIPE_SECRET_KEY
         # Create a stripe token (this would normally be done via javascript in
         # the front end when the submit button was pressed)
@@ -111,7 +116,7 @@ class StripeTest(TestCase):
 
         # Place a donation as an anonymous (not logged in) person using the
         # token we just got
-        r = self.client.post(reverse('donate'), data={
+        params = {
             'amount': amount,
             'amount_other': amount_other,
             'payment_provider': 'cc',
@@ -125,7 +130,10 @@ class StripeTest(TestCase):
             'email': 'barack@freelawproject.org',
             'referrer': 'tests.py',
             'stripeToken': token.id,
-        })
+            'frequency': 'once',
+        }
+        params.update(param_overrides)
+        r = self.client.post(reverse('donate'), data=params)
         return token, r
 
     def get_stripe_event(self, fingerprint):
@@ -206,3 +214,17 @@ class StripeTest(TestCase):
             amount_other='0.40',
         )
         self.assertEqual(r.status_code, HTTP_200_OK)
+
+    def test_making_a_monthly_donation(self):
+        """Can we make a monthly donation correctly?"""
+        stripe.api_key = settings.STRIPE_SECRET_KEY
+        token, r = self.make_a_donation(
+            stripe_test_numbers['good']['visa'],
+            amount='25',
+            param_overrides={'frequency': 'monthly'}
+        )
+        # Redirect after a successful POST?
+        self.assertEqual(r.status_code, HTTP_302_FOUND)
+        self.assertEventPostsCorrectly(token)
+
+

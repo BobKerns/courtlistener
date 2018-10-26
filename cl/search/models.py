@@ -1,28 +1,26 @@
 # coding=utf-8
 import os
 import re
-from datetime import datetime, time
 
 from celery.canvas import chain
-from django.conf import settings
 from django.contrib.contenttypes.fields import GenericRelation
 from django.core.exceptions import ValidationError
 from django.core.urlresolvers import reverse, NoReverseMatch
 from django.db import models
-from django.db.models import Prefetch
+from django.db.models import Prefetch, Q
 from django.template import loader
 from django.utils.encoding import smart_unicode
 from django.utils.text import slugify
 
 from cl.custom_filters.templatetags.text_filters import best_case_name
 from cl.lib import fields
+from cl.lib.date_time import midnight_pst
 from cl.lib.model_helpers import make_upload_path, make_recap_path, \
-    make_recap_pdf_path
+    make_recap_pdf_path, make_recap_thumb_path
 from cl.lib.search_index_utils import InvalidDocumentError, null_map, \
     normalize_search_dicts
 from cl.lib.storage import IncrementingFileSystemStorage
 from cl.lib.string_utils import trunc
-
 
 DOCUMENT_STATUSES = (
     ('Published', 'Precedential'),
@@ -54,6 +52,124 @@ SOURCES = (
     ('ZCR', 'columbia merged with court and resource.org'),
     ('ZL', 'columbia merged with lawbox'),
 )
+
+
+class THUMBNAIL_STATUSES(object):
+    NEEDED = 0
+    COMPLETE = 1
+    FAILED = 2
+    NAMES = (
+        (NEEDED, "Thumbnail needed"),
+        (COMPLETE, "Thumbnail completed successfully"),
+        (FAILED, 'Unable to generate thumbnail'),
+    )
+
+
+class OriginatingCourtInformation(models.Model):
+    """Lower court metadata to associate with appellate cases.
+
+    For example, if you appeal from a district court to a circuit court, the
+    district court information would be in here. You may wonder, "Why do we
+    duplicate this information?" Well:
+
+        1. We don't want to update the lower court case based on information
+           we learn in the upper court. Say they have a conflict? Which do we
+           trust?
+
+        2. We may have the docket from the upper court without ever getting
+           docket information for the lower court. If that happens, would we
+           create a docket for the lower court using only the info in the
+           upper court. That seems bad.
+
+    The other thought you might have is, "Why not just associate this directly
+    with the docket object —-- why do we have a 1to1 join between them?" This
+    was a difficult data modelling decision. There are a few answers:
+
+        1. Most cases in the RECAP Archive are not appellate cases. For those
+           cases, the extra fields for this information would just pollute the
+           Docket namespace.
+
+        2. In general, we prefer to have Docket.originating_court_data.field
+           than, Docket.ogc_field.
+    """
+    date_created = models.DateTimeField(
+        help_text="The time when this item was created",
+        auto_now_add=True,
+        db_index=True,
+    )
+    date_modified = models.DateTimeField(
+        help_text="The last moment when the item was modified.",
+        auto_now=True,
+        db_index=True,
+    )
+    docket_number = models.TextField(
+        help_text="The docket number in the lower court.",
+        blank=True,
+    )
+    assigned_to = models.ForeignKey(
+        'people_db.Person',
+        related_name='original_court_info',
+        help_text="The judge the case was assigned to.",
+        null=True,
+        blank=True,
+    )
+    assigned_to_str = models.TextField(
+        help_text="The judge that the case was assigned to, as a string.",
+        blank=True,
+    )
+    ordering_judge = models.ForeignKey(
+        'people_db.Person',
+        related_name='+',
+        help_text="The judge that issued the final order in the case.",
+        null=True,
+        blank=True,
+    )
+    ordering_judge_str = models.TextField(
+        help_text="The judge that issued the final order in the case, as a "
+                  "string.",
+        blank=True,
+    )
+    court_reporter = models.TextField(
+        help_text="The court reporter responsible for the case.",
+        blank=True,
+    )
+    date_disposed = models.DateField(
+        help_text="The date the case was disposed at the lower court.",
+        blank=True,
+        null=True,
+    )
+    date_filed = models.DateField(
+        help_text="The date the case was filed in the lower court.",
+        blank=True,
+        null=True,
+    )
+    date_judgment = models.DateField(
+        help_text="The date of the order or judgment in the lower court.",
+        blank=True,
+        null=True,
+    )
+    date_judgment_eod = models.DateField(
+        help_text="The date the judgment was Entered On the Docket at the "
+                  "lower court.",
+        blank=True,
+        null=True,
+    )
+    date_filed_noa = models.DateField(
+        help_text="The date the notice of appeal was filed for the case.",
+        blank=True,
+        null=True,
+    )
+    date_received_coa = models.DateField(
+        help_text="The date the case was received at the court of appeals.",
+        blank=True,
+        null=True,
+    )
+
+    def __unicode__(self):
+        return "<OriginatingCourtInformation: %s>" % self.pk
+
+    class Meta:
+        verbose_name_plural = 'Originating Court Information'
 
 
 class Docket(models.Model):
@@ -95,6 +211,33 @@ class Docket(models.Model):
         db_index=True,
         related_name='dockets',
     )
+    appeal_from = models.ForeignKey(
+        'Court',
+        help_text="In appellate cases, this is the lower court or "
+                  "administrative body where this case was originally heard. "
+                  "This field is frequently blank due to it not being "
+                  "populated historically or due to our inability to "
+                  "normalize the value in appeal_from_str.",
+        related_name='+',
+        blank=True,
+        null=True,
+    )
+    appeal_from_str = models.TextField(
+        help_text="In appellate cases, this is the lower court or "
+                  "administrative body where this case was originally heard. "
+                  "This field is frequently blank due to it not being "
+                  "populated historically. This field may have values when "
+                  "the appeal_from field does not. That can happen if we are "
+                  "unable to normalize the value in this field.",
+        blank=True,
+    )
+    originating_court_information = models.OneToOneField(
+        OriginatingCourtInformation,
+        help_text="Lower court information for appellate dockets",
+        related_name="docket",
+        blank=True,
+        null=True,
+    )
     tags = models.ManyToManyField(
         'search.Tag',
         help_text="The tags associated with the docket.",
@@ -128,6 +271,22 @@ class Docket(models.Model):
     )
     referred_to_str = models.TextField(
         help_text="The judge that the case was referred to, as a string.",
+        blank=True,
+    )
+    panel = models.ManyToManyField(
+        'people_db.Person',
+        help_text="The empaneled judges for the case. Currently an unused "
+                  "field but planned to be used in conjunction with the "
+                  "panel_str field.",
+        related_name="empanelled_dockets",
+        blank=True,
+    )
+    panel_str = models.TextField(
+        help_text="The initials of the judges on the panel that heard this "
+                  "case. This field is similar to the 'judges' field on "
+                  "the cluster, but contains initials instead of full judge "
+                  "names, and applies to the case on the whole instead of "
+                  "only to a specific decision.",
         blank=True,
     )
     parties = models.ManyToManyField(
@@ -254,6 +413,23 @@ class Docket(models.Model):
         max_length=100,
         blank=True,
     )
+    appellate_fee_status = models.TextField(
+        help_text="The status of the fee in the appellate court. Can be used "
+                  "as a hint as to whether the government is the appellant "
+                  "(in which case the fee is waived).",
+        blank=True,
+    )
+    appellate_case_type_information = models.TextField(
+        help_text="Information about a case from the appellate docket in "
+                  "PACER. For example, 'civil, private, bankruptcy'.",
+        blank=True,
+    )
+    mdl_status = models.CharField(
+        help_text="The MDL status of a case before the Judicial Panel for "
+                  "Multidistrict Litigation",
+        max_length=100,
+        blank=True,
+    )
     filepath_local = models.FileField(
         help_text="Path to RECAP's Docket XML page.",
         upload_to=make_recap_path,
@@ -265,6 +441,34 @@ class Docket(models.Model):
         help_text="Path to the Docket XML page in The Internet Archive",
         max_length=1000,
         blank=True,
+    )
+    filepath_ia_json = models.CharField(
+        help_text="Path to the docket JSON page in the Internet Archive",
+        max_length=1000,
+        blank=True,
+    )
+    ia_upload_failure_count = models.SmallIntegerField(
+        help_text="Number of times the upload to the Internet Archive failed.",
+        null=True,
+        blank=True,
+    )
+    ia_needs_upload = models.NullBooleanField(
+        help_text="Does this item need to be uploaded to the Internet "
+                  "Archive? I.e., has it changed? This field is important "
+                  "because it keeps track of the status of all the related "
+                  "objects to the docket. For example, if a related docket "
+                  "entry changes, we need to upload the item to IA, but we "
+                  "can't easily check that.",
+        blank=True,
+        db_index=True,
+    )
+    ia_date_first_change = models.DateTimeField(
+        help_text="The moment when this item first changed and was marked as "
+                  "needing an upload. Used for determining when to upload an "
+                  "item.",
+        null=True,
+        blank=True,
+        db_index=True,
     )
     view_count = models.IntegerField(
         help_text="The number of times the docket has been seen.",
@@ -286,6 +490,10 @@ class Docket(models.Model):
 
     class Meta:
         unique_together = ('docket_number', 'pacer_case_id', 'court')
+        index_together = (
+            ('ia_upload_failure_count', 'ia_needs_upload',
+             'ia_date_first_change'),
+        )
 
     def __unicode__(self):
         if self.case_name:
@@ -313,10 +521,16 @@ class Docket(models.Model):
         from cl.lib.pacer import map_cl_to_pacer_id
         court_id = map_cl_to_pacer_id(self.court.pk)
         if self.court.jurisdiction == Court.FEDERAL_APPELLATE:
-            return (u'https://ecf.%s.uscourts.gov/n/beam/servlet/TransportRoom?'
+            if self.court.pk in ['ca5', 'ca7', 'ca11']:
+                path = "/cmecf/servlet/TransportRoom?"
+            else:
+                path = "/n/beam/servlet/TransportRoom?"
+
+            return (u'https://ecf.%s.uscourts.gov'
+                    + path +
                     u'servlet=CaseSummary.jsp&'
                     u'caseNum=%s&'
-                    u'incOrigDkt=Y&' 
+                    u'incOrigDkt=Y&'
                     u'incDktEntries=Y') % (
                 court_id,
                 self.pacer_case_id,
@@ -365,16 +579,16 @@ class Docket(models.Model):
             'jurisdictionType': self.jurisdiction_type,
         }
         if self.date_argued is not None:
-            out['dateArgued'] = datetime.combine(self.date_argued, time())
+            out['dateArgued'] = midnight_pst(self.date_argued)
         if self.date_filed is not None:
-            out['dateFiled'] = datetime.combine(self.date_filed, time())
+            out['dateFiled'] = midnight_pst(self.date_filed)
         if self.date_terminated is not None:
-            out['dateTerminated'] = datetime.combine(self.date_terminated, time())
+            out['dateTerminated'] = midnight_pst(self.date_terminated)
         try:
             out['docket_absolute_url'] = self.get_absolute_url()
         except NoReverseMatch:
-            raise InvalidDocumentError("Unable to save to index due to missing "
-                                       "absolute_url: %s" % self.pk)
+            raise InvalidDocumentError("Unable to save to index due to "
+                                       "missing absolute_url: %s" % self.pk)
 
         # Judges
         if self.assigned_to is not None:
@@ -419,13 +633,13 @@ class Docket(models.Model):
             if de.entry_number is not None:
                 out['entry_number'] = de.entry_number
             if de.date_filed is not None:
-                out['entry_date_filed'] = datetime.combine(de.date_filed,
-                                                           time())
+                out['entry_date_filed'] = midnight_pst(de.date_filed)
             rds = de.recap_documents.all()
 
             if len(rds) == 0:
-                # Minute entry or other entry that lacks docs. For now, we punt.
-                # See https://github.com/freelawproject/courtlistener/issues/784
+                # Minute entry or other entry that lacks docs.
+                # For now, we punt.
+                # https://github.com/freelawproject/courtlistener/issues/784
                 continue
 
             for rd in rds:
@@ -481,8 +695,9 @@ class Docket(models.Model):
         from cl.lib.pacer import process_docket_data
         # Start with the XML if we've got it.
         if do_original_xml and self.filepath_local:
-            from cl.recap.models import IA_XML_FILE
-            process_docket_data(self, self.filepath_local.path, IA_XML_FILE)
+            from cl.recap.models import UPLOAD_TYPE
+            process_docket_data(self, self.filepath_local.path,
+                                UPLOAD_TYPE.IA_XML_FILE)
 
         # Then layer the uploads on top of that.
         for html in self.html_documents.order_by('date_created'):
@@ -494,7 +709,8 @@ class DocketEntry(models.Model):
     docket = models.ForeignKey(
         Docket,
         help_text="Foreign key as a relation to the corresponding Docket "
-                  "object. Specifies which docket the docket entry belongs to.",
+                  "object. Specifies which docket the docket entry "
+                  "belongs to.",
         related_name="docket_entries",
     )
     tags = models.ManyToManyField(
@@ -526,7 +742,9 @@ class DocketEntry(models.Model):
         blank=True,
     )
     entry_number = models.BigIntegerField(
-        help_text="# on the PACER docket page.",
+        help_text="# on the PACER docket page. For appellate cases, this may "
+                  "be the internal PACER ID for the document, when an entry "
+                  "ID is otherwise unavailable.",
     )
     description = models.TextField(
         help_text="The text content of the docket entry that appears in the "
@@ -637,11 +855,17 @@ class RECAPDocument(models.Model):
         blank=True,
         null=True,
     )
+    file_size = models.IntegerField(
+        help_text="The size of the file in bytes, if known",
+        blank=True,
+        null=True,
+    )
     filepath_local = models.FileField(
         help_text="The path of the file in the local storage area.",
         upload_to=make_recap_pdf_path,
         storage=IncrementingFileSystemStorage(),
         max_length=1000,
+        db_index=True,
         blank=True,
     )
     filepath_ia = models.CharField(
@@ -653,6 +877,18 @@ class RECAPDocument(models.Model):
         help_text="Number of times the upload to the Internet Archive failed.",
         null=True,
         blank=True,
+    )
+    thumbnail = models.FileField(
+        help_text="A thumbnail of the first page of the document",
+        upload_to=make_recap_thumb_path,
+        storage=IncrementingFileSystemStorage(),
+        null=True,
+        blank=True,
+    )
+    thumbnail_status = models.SmallIntegerField(
+        help_text="The status of the thumbnail generation",
+        choices=THUMBNAIL_STATUSES.NAMES,
+        default=THUMBNAIL_STATUSES.NEEDED,
     )
     description = models.TextField(
         help_text="The short description of the docket entry that appears on "
@@ -679,6 +915,9 @@ class RECAPDocument(models.Model):
         unique_together = ('docket_entry', 'document_number',
                            'attachment_number')
         ordering = ("document_type", 'document_number', 'attachment_number')
+        index_together = [
+            ["document_type", 'document_number', 'attachment_number'],
+        ]
         permissions = (
             ("has_recap_api_access", "Can work with RECAP API"),
         )
@@ -708,26 +947,36 @@ class RECAPDocument(models.Model):
     def pacer_url(self):
         """Construct a doc1 URL for any item, if we can. Else, return None."""
         from cl.lib.pacer import map_cl_to_pacer_id
-        court_id = map_cl_to_pacer_id(self.docket_entry.docket.court_id)
+        court = self.docket_entry.docket.court
+        court_id = map_cl_to_pacer_id(court.pk)
         if self.pacer_doc_id:
-            return "https://ecf.%s.uscourts.gov/doc1/%s?caseid=%s" % (
+            if court.jurisdiction == Court.FEDERAL_APPELLATE:
+                path = 'docs1'
+            else:
+                path = 'doc1'
+            return "https://ecf.%s.uscourts.gov/%s/%s?caseid=%s" % (
                 court_id,
+                path,
                 self.pacer_doc_id,
                 self.docket_entry.docket.pacer_case_id,
             )
         else:
-            attachment_number = self.attachment_number or ''
-            return ('https://ecf.{court_id}.uscourts.gov/cgi-bin/show_case_doc?'
-                    '{document_number},'
-                    '{pacer_case_id},'
-                    '{attachment_number},'
-                    '{magic_number},'.format(
-                        court_id=court_id,
-                        document_number=self.document_number,
-                        pacer_case_id=self.docket_entry.docket.pacer_case_id,
-                        attachment_number=attachment_number,
-                        magic_number='',  # For future use.
-                    ))
+            if court.jurisdiction == Court.FEDERAL_APPELLATE:
+                return ''
+            else:
+                attachment_number = self.attachment_number or ''
+                return ('https://ecf.{court_id}.uscourts.gov/cgi-bin/'
+                        'show_case_doc?'
+                        '{document_number},'
+                        '{pacer_case_id},'
+                        '{attachment_number},'
+                        '{magic_number},'.format(
+                            court_id=court_id,
+                            document_number=self.document_number,
+                            pacer_case_id=self.docket_entry.docket.pacer_case_id,
+                            attachment_number=attachment_number,
+                            magic_number='',  # For future use.
+                        ))
 
     @property
     def needs_extraction(self):
@@ -744,8 +993,8 @@ class RECAPDocument(models.Model):
     def save(self, do_extraction=False, index=False, *args, **kwargs):
         if self.document_type == self.ATTACHMENT:
             if self.attachment_number is None:
-                raise ValidationError('attachment_number cannot be null for an '
-                                      'attachment.')
+                raise ValidationError('attachment_number cannot be null'
+                                      ' for an attachment.')
 
         if self.pacer_doc_id is None:
             # Juriscraper returns these as null values. Instead we want blanks.
@@ -787,7 +1036,7 @@ class RECAPDocument(models.Model):
         id_cache = self.pk
         super(RECAPDocument, self).delete(*args, **kwargs)
         from cl.search.tasks import delete_items
-        delete_items.delay([id_cache], settings.SOLR_RECAP_URL)
+        delete_items.delay([id_cache], 'recap')
 
     def get_docket_metadata(self):
         """The metadata for the item that comes from the Docket."""
@@ -810,12 +1059,11 @@ class RECAPDocument(models.Model):
             'jurisdictionType': docket.jurisdiction_type,
         })
         if docket.date_argued is not None:
-            out['dateArgued'] = datetime.combine(docket.date_argued, time())
+            out['dateArgued'] = midnight_pst(docket.date_argued)
         if docket.date_filed is not None:
-            out['dateFiled'] = datetime.combine(docket.date_filed, time())
+            out['dateFiled'] = midnight_pst(docket.date_filed)
         if docket.date_terminated is not None:
-            out['dateTerminated'] = datetime.combine(docket.date_terminated,
-                                                     time())
+            out['dateTerminated'] = midnight_pst(docket.date_terminated)
         try:
             out['docket_absolute_url'] = docket.get_absolute_url()
         except NoReverseMatch:
@@ -908,10 +1156,8 @@ class RECAPDocument(models.Model):
         if self.docket_entry.entry_number is not None:
             out['entry_number'] = self.docket_entry.entry_number
         if self.docket_entry.date_filed is not None:
-            out['entry_date_filed'] = datetime.combine(
-                self.docket_entry.date_filed,
-                time()
-            )
+            out['entry_date_filed'] = midnight_pst(
+                self.docket_entry.date_filed)
 
         text_template = loader.get_template('indexes/dockets_text.txt')
         out['text'] = text_template.render({'item': self}).translate(null_map)
@@ -976,9 +1222,15 @@ class Court(models.Model):
         primary_key=True
     )
     pacer_court_id = models.PositiveSmallIntegerField(
-        help_text="The numeric ID for the court in PACER. This can be found by "
-                  "looking at the first three digits of any doc1 URL in PACER.",
+        help_text="The numeric ID for the court in PACER. "
+                  "This can be found by looking at the first three "
+                  "digits of any doc1 URL in PACER.",
         null=True,
+        blank=True,
+    )
+    pacer_has_rss_feed = models.NullBooleanField(
+        help_text="Whether the court has a PACER RSS feed. If null, this "
+                  "doesn't apply to the given court.",
         blank=True,
     )
     fjc_court_id = models.CharField(
@@ -1013,8 +1265,8 @@ class Court(models.Model):
         unique=True
     )
     citation_string = models.CharField(
-        help_text='the citation abbreviation for the court as dictated by Blue '
-                  'Book',
+        help_text='the citation abbreviation for the court '
+                  'as dictated by Blue Book',
         max_length=100,
         blank=True
     )
@@ -1068,6 +1320,43 @@ class Court(models.Model):
         ordering = ["position"]
 
 
+class ClusterCitationQuerySet(models.query.QuerySet):
+    """Add filtering on citation strings.
+
+    Historically we had citations in the db as strings like, "22 U.S. 44". The
+    nice thing about that was that it was fairly easy to look them up. The new
+    way breaks citations into volume-reporter-page tuples. That's great for
+    granularity, but it makes it harder to look things up.
+
+    This class attempts to fix that by overriding the usual filter, adding an
+    additional kwarg that can be provided:
+
+        Citation.object.filter(citation='22 U.S. 44')
+
+    That makes it a lot easier to do the kinds of filtering we're used to.
+    """
+
+    def filter(self, *args, **kwargs):
+        clone = self._clone()
+        citation_str = kwargs.pop('citation', None)
+        if citation_str:
+            try:
+                from cl.citations.find_citations import get_citations
+                c = get_citations(citation_str, html=False,
+                                  do_post_citation=False, do_defendant=False,
+                                  disambiguate=False)[0]
+            except IndexError:
+                raise ValueError("Unable to parse citation '%s'" % citation_str)
+            else:
+                clone.query.add_q(Q(citations__volume=c.volume,
+                                    citations__reporter=c.reporter,
+                                    citations__page=c.page))
+
+        # Add the rest of the args & kwargs
+        clone.query.add_q(Q(*args, **kwargs))
+        return clone
+
+
 class OpinionCluster(models.Model):
     """A class representing a cluster of court opinions."""
     SCDB_DECISION_DIRECTIONS = (
@@ -1082,7 +1371,7 @@ class OpinionCluster(models.Model):
     )
     panel = models.ManyToManyField(
         'people_db.Person',
-        help_text="The judges that heard the oral arguments",
+        help_text="The judges that participated in the opinion",
         related_name="opinion_clusters_participating_judges",
         blank=True,
     )
@@ -1094,9 +1383,9 @@ class OpinionCluster(models.Model):
         blank=True,
     )
     judges = models.TextField(
-        help_text="The judges that heard the oral arguments as a simple text "
-                  "string. This field is used when normalized judges cannot "
-                  "be placed into the panel field.",
+        help_text="The judges that participated in the opinion as a simple "
+                  "text string. This field is used when normalized judges "
+                  "cannot be placed into the panel field.",
         blank=True,
     )
     date_created = models.DateTimeField(
@@ -1125,13 +1414,6 @@ class OpinionCluster(models.Model):
         max_length=75,
         db_index=False,
         null=True,
-    )
-    citation_id = models.IntegerField(
-        help_text="A legacy field that holds the primary key from the old "
-                  "citation table. Used to serve legacy APIs.",
-        db_index=True,
-        null=True,
-        blank=True,
     )
     case_name_short = models.TextField(
         help_text="The abridged name of the case, often a single word, e.g. "
@@ -1294,70 +1576,54 @@ class OpinionCluster(models.Model):
         default=False
     )
 
+    objects = ClusterCitationQuerySet.as_manager()
+
     @property
     def caption(self):
-        """Make a proper caption"""
+        """Make a proper caption
+
+        This selects the best case name, then combines it with the best one or
+        two citations we have in our system. Finally, if it's not a SCOTUS
+        opinion, it adds the court abbreviation to the end. The result is
+        something like:
+
+            Plessy v. Ferguson, 410 U.S. 113
+
+        or
+
+            Lenore Foman v. Elvira A. Davis (1st Cir. 1961)
+
+        Note that nbsp; are used liberally to prevent the end from getting
+        broken up across lines.
+        """
         caption = best_case_name(self)
-        if self.neutral_cite:
-            caption += ", %s" % self.neutral_cite
-            return caption  # neutral cites lack the parentheses, so we're done here.
-        elif self.federal_cite_one:
-            caption += ", %s" % self.federal_cite_one
-        elif self.federal_cite_two:
-            caption += ", %s" % self.federal_cite_two
-        elif self.federal_cite_three:
-            caption += ", %s" % self.federal_cite_three
-        elif self.specialty_cite_one:
-            caption += ", %s" % self.specialty_cite_one
-        elif self.state_cite_regional:
-            caption += ", %s" % self.state_cite_regional
-        elif self.state_cite_one:
-            caption += ", %s" % self.state_cite_one
-        elif self.westlaw_cite and self.lexis_cite:
-            # If both WL and LEXIS
-            caption += ", %s, %s" % (self.westlaw_cite, self.lexis_cite)
-        elif self.westlaw_cite:
-            # If only WL
-            caption += ", %s" % self.westlaw_cite
-        elif self.lexis_cite:
-            # If only LEXIS
-            caption += ", %s" % self.lexis_cite
-        elif self.docket.docket_number:
+        citations = sorted(self.citations.all(), key=sort_cites)
+        if not citations:
             caption += ", %s" % self.docket.docket_number
-        caption += ' ('
-        if self.docket.court.citation_string != 'SCOTUS':
-            caption += re.sub(' ', '&nbsp;', self.docket.court.citation_string)
-            caption += '&nbsp;'
-        caption += '%s)' % self.date_filed.isoformat().split('-')[0]  # b/c strftime f's up before 1900.
+        else:
+            if citations[0].type == Citation.NEUTRAL:
+                caption += ", %s" % citations[0]
+                # neutral cites lack the parentheses, so we're done here.
+                return caption
+            elif citations[0].type == Citation.WEST and \
+                                citations[1].type == Citation.LEXIS:
+                caption += ", %s, %s" % (citations[0], citations[1])
+            else:
+                caption += ", %s" % citations[0]
+
+        if self.docket.court_id != 'scotus':
+            court = re.sub(u' ', u'&nbsp;', self.docket.court.citation_string)
+            # Strftime fails before 1900. Do it this way instead.
+            year = self.date_filed.isoformat().split('-')[0]
+            caption += '&nbsp;({court}&nbsp;{year})'.format(court=court,
+                                                            year=year)
         return caption
-
-    @property
-    def citation_fields(self):
-        """The fields that are used for citations, as a list.
-
-        The order of the items in this list follows BlueBook order, so our
-        citations aren't just willy nilly.
-        """
-        return [
-            'neutral_cite', 'federal_cite_one', 'federal_cite_two',
-            'federal_cite_three', 'scotus_early_cite', 'specialty_cite_one',
-            'state_cite_regional', 'state_cite_one', 'state_cite_two',
-            'state_cite_three', 'westlaw_cite', 'lexis_cite'
-        ]
-
-    @property
-    def citation_list(self):
-        """Make a citation list
-
-        This function creates a series of citations that can be listed as meta
-        data for an opinion.
-        """
-        return [getattr(self, field) for field in self.citation_fields]
 
     @property
     def citation_string(self):
         """Make a citation string, joined by commas"""
-        return ', '.join([cite for cite in self.citation_list if cite])
+        citations = sorted(self.citations.all(), key=sort_cites)
+        return ', '.join(str(c) for c in citations)
 
     @property
     def authorities(self):
@@ -1427,7 +1693,120 @@ class OpinionCluster(models.Model):
         id_cache = self.pk
         super(OpinionCluster, self).delete(*args, **kwargs)
         from cl.search.tasks import delete_items
-        delete_items.delay([id_cache], settings.SOLR_OPINION_URL)
+        delete_items.delay([id_cache], 'opinions')
+
+
+class Citation(models.Model):
+    """A simple class to hold citations."""
+    FEDERAL = 1
+    STATE = 2
+    STATE_REGIONAL = 3
+    SPECIALTY = 4
+    SCOTUS_EARLY = 5
+    LEXIS = 6
+    WEST = 7
+    NEUTRAL = 8
+    CITATION_TYPES = (
+        (FEDERAL, 'A federal reporter citation (e.g. 5 F. 55)'),
+        (STATE, 'A citation in a state-based reporter '
+                '(e.g. Alabama Reports)'),
+        (STATE_REGIONAL, 'A citation in a regional reporter '
+                         '(e.g. Atlantic Reporter)'),
+        (SPECIALTY, 'A citation in a specialty reporter '
+                    '(e.g. Lawyers\' Edition)'),
+        (SCOTUS_EARLY, 'A citation in an early SCOTUS reporter '
+                       '(e.g. 5 Black. 55)'),
+        (LEXIS, 'A citation in the Lexis system (e.g. 5 LEXIS 55)'),
+        (WEST, 'A citation in the WestLaw system (e.g. 5 WL 55)'),
+        (NEUTRAL, 'A vendor neutral citation (e.g. 2013 FL 1)'),
+    )
+    cluster = models.ForeignKey(
+        OpinionCluster,
+        help_text="The cluster that the citation applies to",
+        related_name="citations",
+    )
+    volume = models.SmallIntegerField(
+        help_text="The volume of the reporter",
+    )
+    reporter = models.TextField(
+        help_text="The abbreviation for the reporter",
+        # To generate lists of volumes for a reporter we need everything in a
+        # reporter. This answers, "Which volumes do we have for F. 2d?"
+        db_index=True,
+    )
+    page = models.TextField(
+        help_text="The 'page' of the citation in the reporter. Unfortunately, "
+                  "this is not an integer, but is a string-type because "
+                  "several jurisdictions do funny things with the so-called "
+                  "'page'. For example, we have seen Roman numerals in "
+                  "Nebraska, 13301-M in Connecticut, and 144M in Montana.",
+    )
+    type = models.SmallIntegerField(
+        help_text="The type of citation that this is.",
+        choices=CITATION_TYPES,
+    )
+
+    def __unicode__(self):
+        # Note this representation is used in the front end.
+        return u'{volume} {reporter} {page}'.format(**self.__dict__)
+
+    def get_absolute_url(self):
+        return self.cluster.get_absolute_url()
+
+    class Meta:
+        index_together = (
+            # To look up individual citations
+            ('volume', 'reporter', 'page'),
+            # To generate reporter volume lists
+            ('volume', 'reporter'),
+        )
+        unique_together = (
+            ('cluster', 'volume', 'reporter', 'page'),
+        )
+
+
+def sort_cites(c):
+    """Sort a list or QuerySet of citations according to BlueBook ordering.
+
+    This is intended as a parameter to the 'key' argument of a sorting method
+    like `sort` or `sorted`. It intends to take a single citation and give it a
+    numeric score as to where it should occur in a list of other citations.
+
+    For example:
+
+        cs = Citation.objects.filter(cluser_id=222)
+        cs = sorted(cs, key=sort_cites)
+
+    That'd give you the list of the Citation items sorted by their priority.
+
+    :param c: A Citation object to score.
+    :return: A score for the Citation passed in.
+    """
+    if c.type == Citation.NEUTRAL:
+        return 0
+    if c.type == Citation.FEDERAL:
+        if c.reporter == 'U.S.':
+            return 1.1
+        elif c.reporter == 'S. Ct.':
+            return 1.2
+        elif 'L. Ed.' in c.reporter:
+            return 1.3
+        else:
+            return 1.4
+    elif c.type == Citation.SCOTUS_EARLY:
+        return 2
+    elif c.type == Citation.SPECIALTY:
+        return 3
+    elif c.type == Citation.STATE_REGIONAL:
+        return 4
+    elif c.type == Citation.STATE:
+        return 5
+    elif c.type == Citation.WEST:
+        return 6
+    elif c.type == Citation.LEXIS:
+        return 7
+    else:
+        return 8
 
 
 class Opinion(models.Model):
@@ -1472,7 +1851,8 @@ class Opinion(models.Model):
     joined_by = models.ManyToManyField(
         'people_db.Person',
         related_name='opinions_joined',
-        help_text="Other judges that joined the primary author in this opinion",
+        help_text="Other judges that joined the primary author "
+                  "in this opinion",
         blank=True,
     )
     date_created = models.DateTimeField(
@@ -1604,14 +1984,10 @@ class Opinion(models.Model):
             'panel_ids': [judge.pk for judge in self.cluster.panel.all()],
             'non_participating_judge_ids': [
                 judge.pk for judge in
-                    self.cluster.non_participating_judges.all()
+                self.cluster.non_participating_judges.all()
             ],
             'judge': self.cluster.judges,
-            'lexisCite': self.cluster.lexis_cite,
-            'citation': [
-                cite for cite in
-                    self.cluster.citation_list if cite],  # Nuke '' and None
-            'neutralCite': self.cluster.neutral_cite,
+            'citation': [str(cite) for cite in self.cluster.citations.all()],
             'scdb_id': self.cluster.scdb_id,
             'source': self.cluster.source,
             'attorney': self.cluster.attorneys,
@@ -1620,11 +1996,20 @@ class Opinion(models.Model):
             'status': self.cluster.get_precedential_status_display(),
             'status_exact': self.cluster.get_precedential_status_display(),
         })
+        try:
+            out['lexisCite'] = str(self.cluster.citations.filter(
+                type=Citation.LEXIS)[0])
+        except IndexError:
+            pass
+
+        try:
+            out['neutralCite'] = str(self.cluster.citations.filter(
+                type=Citation.NEUTRAL)[0])
+        except IndexError:
+            pass
+
         if self.cluster.date_filed is not None:
-            out['dateFiled'] = datetime.combine(
-                self.cluster.date_filed,
-                time()
-            )  # Midnight, PST
+            out['dateFiled'] = midnight_pst(self.cluster.date_filed)
         try:
             out['absolute_url'] = self.cluster.get_absolute_url()
         except NoReverseMatch:
@@ -1637,20 +2022,14 @@ class Opinion(models.Model):
         # Docket
         docket = {'docketNumber': self.cluster.docket.docket_number}
         if self.cluster.docket.date_argued is not None:
-            docket['dateArgued'] = datetime.combine(
-                self.cluster.docket.date_argued,
-                time(),
-            )
+            docket['dateArgued'] = midnight_pst(
+                self.cluster.docket.date_argued)
         if self.cluster.docket.date_reargued is not None:
-            docket['dateReargued'] = datetime.combine(
-                self.cluster.docket.date_reargued,
-                time(),
-            )
+            docket['dateReargued'] = midnight_pst(
+                self.cluster.docket.date_reargued)
         if self.cluster.docket.date_reargument_denied is not None:
-            docket['dateReargumentDenied'] = datetime.combine(
-                self.cluster.docket.date_reargument_denied,
-                time(),
-            )
+            docket['dateReargumentDenied'] = midnight_pst(
+                self.cluster.docket.date_reargument_denied)
         out.update(docket)
 
         court = {
@@ -1679,23 +2058,23 @@ class OpinionsCited(models.Model):
         Opinion,
         related_name='citing_opinions',
     )
-    # depth = models.IntegerField(
-    #     help_text='The number of times the cited opinion was cited '
-    #               'in the citing opinion',
-    #     default=1,
-    #     db_index=True,
-    # )
-    # quoted = models.BooleanField(
-    #     help_text='Equals true if previous case was quoted directly',
-    #     default=False,
-    #     db_index=True,
-    # )
-    #treatment: positive, negative, etc.
+    #  depth = models.IntegerField(
+    #      help_text='The number of times the cited opinion was cited '
+    #                'in the citing opinion',
+    #      default=1,
+    #      db_index=True,
+    #  )
+    #  quoted = models.BooleanField(
+    #      help_text='Equals true if previous case was quoted directly',
+    #      default=False,
+    #      db_index=True,
+    #  )
+    # treatment: positive, negative, etc.
     #
 
     def __unicode__(self):
-        return u'%s ⤜--cites⟶  %s' % (self.citing_opinion.id,
-                                        self.cited_opinion.id)
+        return u'%s ⤜--cites⟶  %s' % (
+            self.citing_opinion.id, self.cited_opinion.id)
 
     class Meta:
         verbose_name_plural = 'Opinions cited'
@@ -1724,37 +2103,71 @@ class Tag(models.Model):
     def __unicode__(self):
         return u'%s: %s' % (self.pk, self.name)
 
-#class AppellateReview(models.Model):
-#    REVIEW_STANDARDS = (
-#        ('d', 'Discretionary'),
-#        ('m', 'Mandatory'),
-#        ('s', 'Special or Mixed'),
-#    )
-#    upper_court = models.ForeignKey(
-#        Court,
-#        related_name='lower_courts_reviewed',
-#    )
-#    lower_court = models.ForeignKey(
-#        Court,
-#        related_name='reviewed_by',
-#    )
-#    date_start = models.DateTimeField(
-#        help_text="The date this appellate review relationship began",
-#        db_index=True,
-#        null=True
-#    )
-#    date_end = models.DateTimeField(
-#        help_text="The date this appellate review relationship ended",
-#        db_index=True,
-#        null=True
-#    )
-#    review_standard =  models.CharField(
-#        max_length=1,
-#        choices=REVIEW_STANDARDS,
-#    )
-#    def __unicode__(self):
-#        return u'%s ⤜--reviewed by⟶  %s' % (self.lower_court.id,
-#                                        self.upper_court.id)
+    def tag_object(self, thing):
+        """Atomically add a tag to an item.
+
+        Django has a system for adding to a m2m relationship like the ones
+        between tags and other objects. Normally, you can just use:
+
+            some_thing.add(tag)
+
+        Alas, that's not atomic and if you have multiple processes or threads
+        running — as you would in a Celery queue — you will get
+        IntegrityErrors. So...this function does the same thing by using the
+        tag through tables, as described here:
+
+            https://stackoverflow.com/a/37968648/64911
+
+        By using get_or_create calls, we make it atomic, fixing the problem.
+
+        :param thing: Either a Docket, DocketEntry, or RECAPDocument that you
+        wish to tag.
+        :return: A tuple with the tag and whether a new item was created
+        """
+        if type(thing) == Docket:
+            return self.dockets.through.objects.get_or_create(
+                docket_id=thing.pk, tag_id=self.pk)
+        elif type(thing) == DocketEntry:
+            return self.docket_entries.through.objects.get_or_create(
+                docketentry_id=thing.pk, tag_id=self.pk)
+        elif type(thing) == RECAPDocument:
+            return self.recap_documents.through.objects.get_or_create(
+                    recapdocument_id=thing.pk, tag_id=self.pk)
+        else:
+            raise NotImplementedError("Object type not supported for tagging.")
+
+
+# class AppellateReview(models.Model):
+#     REVIEW_STANDARDS = (
+#         ('d', 'Discretionary'),
+#         ('m', 'Mandatory'),
+#         ('s', 'Special or Mixed'),
+#     )
+#     upper_court = models.ForeignKey(
+#         Court,
+#         related_name='lower_courts_reviewed',
+#     )
+#     lower_court = models.ForeignKey(
+#         Court,
+#         related_name='reviewed_by',
+#     )
+#     date_start = models.DateTimeField(
+#         help_text="The date this appellate review relationship began",
+#         db_index=True,
+#         null=True
+#     )
+#     date_end = models.DateTimeField(
+#         help_text="The date this appellate review relationship ended",
+#         db_index=True,
+#         null=True
+#     )
+#     review_standard =  models.CharField(
+#         max_length=1,
+#         choices=REVIEW_STANDARDS,
+#     )
+#     def __unicode__(self):
+#         return u'%s ⤜--reviewed by⟶  %s' % (self.lower_court.id,
+#                                         self.upper_court.id)
 #
-#    class Meta:
-#        unique_together = ("upper_court", "lower_court")
+#     class Meta:
+#         unique_together = ("upper_court", "lower_court")
